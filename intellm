@@ -32,6 +32,7 @@ BUILDS_CONF="$LCPP_DIR/builds.conf"
 GGUF_CTX="$LCPP_DIR/gguf-ctx.py"
 CONFIGS_DIR="$INTELLM_HOME/configs"
 KVCACHE_DIR="${KVCACHE_DIR:-/mnt/optane/kv-cache}"
+STATE_DIR="${INTELLM_STATE_DIR:-$HOME/.cache/intellm/servers}"
 
 # ---------------- helpers ----------------
 die()   { printf '\n\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -56,6 +57,283 @@ resolve() {
   printf '%s/%s' "$INTELLM_HOME" "$p"
 }
 
+# ============================================================
+# show_config / server lifecycle helpers
+# ============================================================
+# Both `intellm --show-config NAME` and `intellm server start/status/stop`
+# need to compute "what would this config resolve to" without going through
+# the interactive walkthrough. resolve_config_silent does that.
+#
+# Outputs (as globals): R_BUILD R_MODE R_MODEL R_MODEL_PATH R_MMPROJ
+#   R_MMPROJ_PATH R_CTX R_KV R_HOST R_PORT R_SLOTS R_PROMPT_CACHE R_URL
+#   R_BUILD_BIN R_BUILD_ENV
+resolve_config_silent() {
+  local name="$1"
+  local path="$CONFIGS_DIR/$name.conf"
+  [[ -f "$path" ]] || { echo "no such config: $name ($path)" >&2; return 1; }
+
+  local build="" mode="" model="" ctx="" kv="" host="0.0.0.0" port="8080" slots="1" prompt_cache="" mmproj=""
+  # shellcheck disable=SC1090
+  source "$path"
+
+  export R_BUILD="$build"
+  export R_MODE="$mode"
+  export R_MODEL="$model"
+  export R_MMPROJ="$mmproj"
+  export R_CTX="$ctx"
+  export R_KV="$kv"
+  export R_HOST="$host"
+  export R_PORT="$port"
+  export R_SLOTS="$slots"
+  export R_PROMPT_CACHE="$prompt_cache"
+
+  # Resolve model path
+  export R_MODEL_PATH=""
+  if [[ -n "$model" && "$model" != hf:* ]]; then
+    if [[ "${model:0:1}" == "/" ]]; then R_MODEL_PATH="$model"
+    else R_MODEL_PATH="$MODELS_DIR/$model"; fi
+  fi
+  export R_MMPROJ_PATH=""
+  if [[ -n "$mmproj" ]]; then
+    if [[ "${mmproj:0:1}" == "/" ]]; then R_MMPROJ_PATH="$mmproj"
+    else R_MMPROJ_PATH="$MODELS_DIR/$mmproj"; fi
+  fi
+
+  # Lookup build details
+  export R_BUILD_BIN=""
+  export R_BUILD_ENV=""
+  if [[ -f "$BUILDS_CONF" ]]; then
+    local s n b e x
+    while IFS='|' read -r s n b e x; do
+      s="$(trim "$s")"
+      [[ -z "$s" || "${s:0:1}" == "#" ]] && continue
+      if [[ "$s" == "$build" ]]; then
+        R_BUILD_BIN="$(resolve "$(trim "$b")")"
+        R_BUILD_ENV="$(resolve "$(trim "$e")")"
+        break
+      fi
+    done < "$BUILDS_CONF"
+  fi
+
+  export R_URL=""
+  [[ "$mode" == "server" ]] && R_URL="http://${host}:${port}/v1"
+  return 0
+}
+
+# Emit JSON for a resolved config. Uses python3 for safe escaping.
+emit_config_json() {
+  local name="$1"
+  python3 - "$name" <<'PY'
+import json, sys, os
+name = sys.argv[1]
+data = {
+    "name": name,
+    "build":         os.environ.get("R_BUILD", ""),
+    "mode":          os.environ.get("R_MODE", ""),
+    "model":         os.environ.get("R_MODEL", ""),
+    "model_path":    os.environ.get("R_MODEL_PATH", ""),
+    "mmproj":        os.environ.get("R_MMPROJ", ""),
+    "mmproj_path":   os.environ.get("R_MMPROJ_PATH", ""),
+    "ctx":           os.environ.get("R_CTX", ""),
+    "kv":            os.environ.get("R_KV", ""),
+    "host":          os.environ.get("R_HOST", ""),
+    "port":          os.environ.get("R_PORT", ""),
+    "slots":         os.environ.get("R_SLOTS", ""),
+    "prompt_cache":  os.environ.get("R_PROMPT_CACHE", ""),
+    "url":           os.environ.get("R_URL", ""),
+    "build_bin":     os.environ.get("R_BUILD_BIN", ""),
+    "build_env":     os.environ.get("R_BUILD_ENV", ""),
+}
+print(json.dumps(data, indent=2))
+PY
+}
+
+# State file helpers (one file per running server, named by config).
+# Format: simple `key=value` lines for trivial bash parsing.
+state_file_for() { printf '%s/%s.state' "$STATE_DIR" "$1"; }
+log_file_for()   { printf '%s/%s.log'   "$STATE_DIR" "$1"; }
+state_get() {  # state_get FILE KEY
+  awk -F= -v k="$2" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$1"
+}
+is_alive() { kill -0 "$1" 2>/dev/null; }
+
+# ============================================================
+# subcommand: intellm server {start|status|stop|logs}
+# ============================================================
+server_start() {
+  local cfg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config) cfg="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$cfg" ]] || { echo "usage: intellm server start --config NAME" >&2; exit 2; }
+
+  resolve_config_silent "$cfg" || exit 1
+  [[ "$R_MODE" == "server" ]] || { echo "config '$cfg' is mode=$R_MODE, not server" >&2; exit 2; }
+  export R_BUILD R_MODE R_MODEL R_MODEL_PATH R_MMPROJ R_MMPROJ_PATH R_CTX R_KV R_HOST R_PORT R_SLOTS R_PROMPT_CACHE R_URL R_BUILD_BIN R_BUILD_ENV
+
+  mkdir -p "$STATE_DIR"
+  local sf; sf="$(state_file_for "$cfg")"
+  local lf; lf="$(log_file_for "$cfg")"
+
+  if [[ -f "$sf" ]]; then
+    local existing_pid; existing_pid="$(state_get "$sf" pid)"
+    if [[ -n "$existing_pid" ]] && is_alive "$existing_pid"; then
+      echo "server '$cfg' already running (pid=$existing_pid, url=$(state_get "$sf" url))" >&2
+      exit 1
+    fi
+    rm -f "$sf"
+  fi
+
+  # Daemonize: setsid + nohup + disown. Inherits stdout/stderr to log file.
+  setsid nohup "$SCRIPT_PATH" --config "$cfg" </dev/null >>"$lf" 2>&1 &
+  local pid=$!
+  disown 2>/dev/null || true
+
+  # Write state immediately so other tools can discover it; refresh url/etc.
+  {
+    printf 'config=%s\n' "$cfg"
+    printf 'pid=%s\n'    "$pid"
+    printf 'url=%s\n'    "$R_URL"
+    printf 'host=%s\n'   "$R_HOST"
+    printf 'port=%s\n'   "$R_PORT"
+    printf 'model=%s\n'  "$R_MODEL"
+    printf 'build=%s\n'  "$R_BUILD"
+    printf 'ctx=%s\n'    "$R_CTX"
+    printf 'kv=%s\n'     "$R_KV"
+    printf 'slots=%s\n'  "$R_SLOTS"
+    printf 'mmproj=%s\n' "$R_MMPROJ"
+    printf 'log=%s\n'    "$lf"
+    printf 'started_at=%s\n' "$(date -Iseconds)"
+  } > "$sf"
+
+  printf 'started: %s (pid=%s, url=%s)\n' "$cfg" "$pid" "$R_URL"
+  printf '  log: %s\n' "$lf"
+  printf '  (server typically takes 10-20s to bind the port; poll %s/models)\n' "$R_URL"
+}
+
+server_status() {
+  local json_mode=""
+  [[ "${1:-}" == "--json" ]] && json_mode=1
+
+  mkdir -p "$STATE_DIR"
+  local found=0
+  if [[ -n "$json_mode" ]]; then
+    printf '['
+  else
+    printf '%-24s %-7s %-6s %-32s %-12s %s\n' "CONFIG" "PID" "ALIVE" "URL" "MODEL_SHORT" "STARTED"
+  fi
+  local first=1
+  for sf in "$STATE_DIR"/*.state; do
+    [[ -e "$sf" ]] || continue
+    local cfg pid url model started host port build ctx kv slots
+    cfg="$(state_get "$sf" config)"
+    pid="$(state_get "$sf" pid)"
+    url="$(state_get "$sf" url)"
+    model="$(state_get "$sf" model)"
+    started="$(state_get "$sf" started_at)"
+    host="$(state_get "$sf" host)"
+    port="$(state_get "$sf" port)"
+    build="$(state_get "$sf" build)"
+    ctx="$(state_get "$sf" ctx)"
+    kv="$(state_get "$sf" kv)"
+    slots="$(state_get "$sf" slots)"
+    local alive=no
+    is_alive "$pid" && alive=yes
+    found=1
+    if [[ -n "$json_mode" ]]; then
+      [[ $first -eq 1 ]] || printf ','
+      first=0
+      python3 - "$cfg" "$pid" "$url" "$model" "$started" "$alive" "$host" "$port" "$build" "$ctx" "$kv" "$slots" <<'PY'
+import json, sys
+keys=("config","pid","url","model","started_at","alive","host","port","build","ctx","kv","slots")
+print(json.dumps(dict(zip(keys, sys.argv[1:]))), end='')
+PY
+    else
+      printf '%-24s %-7s %-6s %-32s %-12s %s\n' \
+        "$cfg" "$pid" "$alive" "$url" "${model:0:12}" "$started"
+    fi
+  done
+  if [[ -n "$json_mode" ]]; then
+    printf ']\n'
+  elif [[ $found -eq 0 ]]; then
+    echo "(no servers running. start one with: intellm server start --config NAME)"
+  fi
+}
+
+server_stop() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || { echo "usage: intellm server stop NAME|all" >&2; exit 2; }
+
+  if [[ "$target" == "all" ]]; then
+    local sf
+    for sf in "$STATE_DIR"/*.state; do
+      [[ -e "$sf" ]] || continue
+      server_stop "$(state_get "$sf" config)"
+    done
+    return 0
+  fi
+
+  local sf; sf="$(state_file_for "$target")"
+  [[ -f "$sf" ]] || { echo "no state for '$target' (try: intellm server status)" >&2; exit 1; }
+  local pid; pid="$(state_get "$sf" pid)"
+  if [[ -z "$pid" ]] || ! is_alive "$pid"; then
+    echo "(already stopped) removing stale state for '$target'"
+    rm -f "$sf"
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  # Wait up to 5s for graceful shutdown
+  local i=0
+  while is_alive "$pid" && [[ $i -lt 50 ]]; do sleep 0.1; i=$((i+1)); done
+  if is_alive "$pid"; then
+    echo "(SIGTERM ignored, sending SIGKILL)"
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 0.5
+  fi
+  rm -f "$sf"
+  echo "stopped: $target (pid=$pid)"
+}
+
+server_logs() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || { echo "usage: intellm server logs NAME" >&2; exit 2; }
+  local lf; lf="$(log_file_for "$target")"
+  [[ -f "$lf" ]] || { echo "no log for '$target' at $lf" >&2; exit 1; }
+  exec tail -f -n 50 "$lf"
+}
+
+server_subcommand() {
+  local sub="${1:-}"
+  shift 2>/dev/null || true
+  case "$sub" in
+    start)  server_start "$@" ;;
+    status) server_status "$@" ;;
+    stop)   server_stop "$@" ;;
+    logs)   server_logs "$@" ;;
+    *)
+      cat <<EOF >&2
+usage:
+  intellm server start --config NAME      Start the server in the background.
+  intellm server status [--json]          List running servers.
+  intellm server stop NAME|all            Stop a running server.
+  intellm server logs NAME                Follow log of a running server.
+EOF
+      exit 2
+      ;;
+  esac
+}
+
+# Dispatch the `server` subcommand BEFORE the main flow (which is for
+# foreground / interactive use).
+if [[ "${1:-}" == "server" ]]; then
+  shift
+  server_subcommand "$@"
+  exit $?
+fi
+
 # ---------------- defaults ----------------
 BUILD_SHORT=""    # vulkan | sycl | ...
 MODE=""           # cli | server | bench
@@ -71,6 +349,7 @@ NAMED_CONFIG=""
 FORCE_INTERACTIVE=""
 LIST_KIND=""
 LIST_JSON=""
+SHOW_CONFIG=""
 
 usage() {
   cat <<EOF
@@ -82,6 +361,11 @@ Usage:
   intellm --build sycl --mode chat --model Qwen3.6-27B-Q6_K.gguf --ctx 32768 --kv q8_0
   intellm --list builds|models|configs
   intellm --list-json builds|models|configs
+  intellm --show-config NAME       print a config's resolved values as JSON
+  intellm server start --config N  start the server in the background (daemonized)
+  intellm server status [--json]   list running servers
+  intellm server stop NAME|all     stop a running server
+  intellm server logs NAME         follow a running server's log
 
 Flags:
   --config NAME            load $CONFIGS_DIR/NAME.conf (then any flag below overrides)
@@ -125,6 +409,7 @@ while [[ $# -gt 0 ]]; do
     --interactive)     FORCE_INTERACTIVE=1; shift ;;
     --list)            LIST_KIND="$2"; shift 2 ;;
     --list-json)       LIST_JSON="$2"; shift 2 ;;
+    --show-config)     SHOW_CONFIG="$2"; shift 2 ;;
     *)                 echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
@@ -199,6 +484,12 @@ to_json_array() {
   done
   printf ']\n'
 }
+
+if [[ -n "$SHOW_CONFIG" ]]; then
+  resolve_config_silent "$SHOW_CONFIG" || exit 1
+  emit_config_json "$SHOW_CONFIG"
+  exit 0
+fi
 
 if [[ -n "$LIST_KIND" ]]; then
   case "$LIST_KIND" in
