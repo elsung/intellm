@@ -66,6 +66,7 @@ HOST="0.0.0.0"
 PORT="8080"
 SLOTS=1
 PROMPT_CACHE_NAME=""   # name (no ext); resolves to $KVCACHE_DIR/<name>.bin
+MMPROJ_NAME=""         # vision/audio projector: filename in MODELS_DIR, abs path, or empty
 NAMED_CONFIG=""
 FORCE_INTERACTIVE=""
 LIST_KIND=""
@@ -94,6 +95,8 @@ Flags:
   --port PORT              server port (default 8080)
   --slots N                server parallel slots (default 1)
   --prompt-cache NAME      chat prompt-cache file under \$KVCACHE_DIR
+  --mmproj NAME|PATH       vision/audio projector (mmproj GGUF). Switches chat mode to
+                           llama-mtmd-cli. NAME = filename in MODELS_DIR; or absolute path.
   --interactive            force interactive even if a default config exists
   --help, -h               show this
 
@@ -118,6 +121,7 @@ while [[ $# -gt 0 ]]; do
     --port)            PORT="$2"; shift 2 ;;
     --slots)           SLOTS="$2"; shift 2 ;;
     --prompt-cache)    PROMPT_CACHE_NAME="$2"; shift 2 ;;
+    --mmproj)          MMPROJ_NAME="$2"; shift 2 ;;
     --interactive)     FORCE_INTERACTIVE=1; shift ;;
     --list)            LIST_KIND="$2"; shift 2 ;;
     --list-json)       LIST_JSON="$2"; shift 2 ;;
@@ -133,7 +137,7 @@ load_config() {
   [[ -f "$path" ]] || die "no such config: $name ($path)"
   # Configs are sourced in a subshell-like pattern: set local vars only,
   # then promote to our defaults only when the corresponding flag wasn't set.
-  local build="" mode="" model="" ctx="" kv="" host="" port="" slots="" prompt_cache=""
+  local build="" mode="" model="" ctx="" kv="" host="" port="" slots="" prompt_cache="" mmproj=""
   # shellcheck disable=SC1090
   source "$path"
   [[ -z "$BUILD_SHORT"       && -n "$build"        ]] && BUILD_SHORT="$build"
@@ -145,6 +149,7 @@ load_config() {
   [[ "$PORT" == "8080"       && -n "$port"         ]] && PORT="$port"
   [[ "$SLOTS" == "1"         && -n "$slots"        ]] && SLOTS="$slots"
   [[ -z "$PROMPT_CACHE_NAME" && -n "$prompt_cache" ]] && PROMPT_CACHE_NAME="$prompt_cache"
+  [[ -z "$MMPROJ_NAME"       && -n "$mmproj"       ]] && MMPROJ_NAME="$mmproj"
   return 0
 }
 
@@ -296,7 +301,7 @@ if [[ -n "$MODEL_SPEC" ]]; then
   resolve_model_spec "$MODEL_SPEC"
 else
   title "Model"
-  mapfile -t MODELS < <(find -L "$MODELS_DIR" -maxdepth 3 -name '*.gguf' -type f -not -iname 'mmproj*' -printf '%P\n' 2>/dev/null | sort)
+  mapfile -t MODELS < <(find -L "$MODELS_DIR" -maxdepth 3 -name '*.gguf' -type f -not -iname '*mmproj*' -printf '%P\n' 2>/dev/null | sort)
   OPTS=("${MODELS[@]}" "[paste Hugging Face repo:quant]")
   PS3=$'\nmodel> '
   select _ in "${OPTS[@]}"; do
@@ -310,6 +315,40 @@ else
     resolve_model_spec "hf:$HF_REF"
   else
     resolve_model_spec "$PICK"
+  fi
+fi
+
+# ---------------- resolve mmproj (multimodal projector) ----------------
+# Sets MMPROJ_FILE to abs path of a vision/audio projector GGUF, or empty.
+# When set: cli mode uses llama-mtmd-cli; server mode passes --mmproj.
+MMPROJ_FILE=""
+resolve_mmproj_spec() {
+  local s="$1"
+  [[ -z "$s" ]] && return 0
+  if [[ "$s" == /* ]]; then
+    [[ -f "$s" ]] || die "mmproj not found: $s"
+    MMPROJ_FILE="$s"
+  else
+    local cand="$MODELS_DIR/$s"
+    [[ -f "$cand" ]] || die "mmproj not found in MODELS_DIR: $s"
+    MMPROJ_FILE="$cand"
+  fi
+}
+if [[ -n "$MMPROJ_NAME" ]]; then
+  resolve_mmproj_spec "$MMPROJ_NAME"
+elif [[ "$MODE" != "bench" && -t 0 && ( -z "$NAMED_CONFIG" || -n "$FORCE_INTERACTIVE" ) ]]; then
+  # Interactive: only ask if we're already in a fully-interactive walkthrough.
+  mapfile -t MMPROJS < <(find -L "$MODELS_DIR" -maxdepth 3 -type f -iname '*mmproj*.gguf' -printf '%P\n' 2>/dev/null | sort)
+  if [[ ${#MMPROJS[@]} -gt 0 ]]; then
+    title "Vision / audio projector (mmproj)"
+    dim "Pair this run with a multimodal projector (Omni / VL models). Pick 'none' for text-only."
+    MM_OPTS=("none (text-only)" "${MMPROJS[@]}")
+    PS3=$'\nmmproj> '
+    select _ in "${MM_OPTS[@]}"; do
+      [[ "${REPLY:-}" =~ ^[0-9]+$ && $REPLY -ge 1 && $REPLY -le ${#MM_OPTS[@]} ]] && break
+      echo "invalid choice"
+    done
+    [[ "$REPLY" -gt 1 ]] && MMPROJ_FILE="$MODELS_DIR/${MM_OPTS[$((REPLY-1))]}"
   fi
 fi
 
@@ -432,11 +471,22 @@ fi
 
 # ---------------- assemble + exec ----------------
 case "$MODE" in
-  cli)    BIN="$BUILD_BIN/llama-cli" ;;
+  cli)
+    # llama-mtmd-cli handles text-only too but llama-cli is the lighter binary
+    # when no projector is needed.
+    if [[ -n "$MMPROJ_FILE" ]]; then
+      BIN="$BUILD_BIN/llama-mtmd-cli"
+    else
+      BIN="$BUILD_BIN/llama-cli"
+    fi
+    ;;
   server) BIN="$BUILD_BIN/llama-server" ;;
   bench)  BIN="$BUILD_BIN/llama-bench" ;;
 esac
 [[ -x "$BIN" ]] || die "$BIN not found or not executable"
+if [[ "$MODE" == "bench" && -n "$MMPROJ_FILE" ]]; then
+  dim "(warning: --mmproj is ignored in bench mode)"
+fi
 
 declare -a KV_ARGS=()
 if [[ "$MODE" != "bench" && -n "$KV_TYPE" && "$KV_TYPE" != "f16" ]]; then
@@ -447,13 +497,18 @@ if [[ -n "$PROMPT_CACHE_FILE" ]]; then
   PC_ARGS=(--prompt-cache "$PROMPT_CACHE_FILE" --prompt-cache-all)
 fi
 
+declare -a MM_ARGS=()
+if [[ -n "$MMPROJ_FILE" && "$MODE" != "bench" ]]; then
+  MM_ARGS=(--mmproj "$MMPROJ_FILE")
+fi
+
 declare -a ARGS
 case "$MODE" in
   cli)
-    ARGS=("${MODEL_ARGS[@]}" -c "$CTX" -ngl 99 --color on -cnv -fa auto "${KV_ARGS[@]}" "${PC_ARGS[@]}")
+    ARGS=("${MODEL_ARGS[@]}" "${MM_ARGS[@]}" -c "$CTX" -ngl 99 --color on -cnv -fa auto "${KV_ARGS[@]}" "${PC_ARGS[@]}")
     ;;
   server)
-    ARGS=("${MODEL_ARGS[@]}" -c "$CTX" -ngl 99 --host "$HOST" --port "$PORT" -fa auto --jinja -np "$SLOTS" -cb "${KV_ARGS[@]}")
+    ARGS=("${MODEL_ARGS[@]}" "${MM_ARGS[@]}" -c "$CTX" -ngl 99 --host "$HOST" --port "$PORT" -fa auto --jinja -np "$SLOTS" -cb "${KV_ARGS[@]}")
     ;;
   bench)
     ARGS=("${MODEL_ARGS[@]}" -ngl 99 -p 512 -n 128 -r 3)
@@ -467,6 +522,7 @@ printf '  model:   %s\n' "$MODEL_LABEL"
 [[ "$MODE" != "bench" ]] && printf '  ctx:     %s\n' "$(pretty_ctx "$CTX")"
 [[ "$MODE" != "bench" && -n "$KV_TYPE" ]] && printf '  kv:      %s\n' "$KV_TYPE"
 [[ -n "$PROMPT_CACHE_FILE" ]] && printf '  pcache:  %s\n' "$PROMPT_CACHE_FILE"
+[[ -n "$MMPROJ_FILE"       ]] && printf '  mmproj:  %s\n' "$MMPROJ_FILE"
 if [[ "$MODE" == "server" ]]; then
   printf '  bind:    http://%s:%s\n' "$HOST" "$PORT"
   printf '  slots:   %s (continuous batching on)\n' "$SLOTS"
