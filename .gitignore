@@ -8,10 +8,12 @@ llama.cpp/src/
 # Per-machine build artifacts
 llama.cpp/build-*/
 
-# Per-user named configs except the bundled example/default
+# Per-user named configs except bundled example/default + canonical templates
 configs/*.conf
 !configs/example.conf
 !configs/default.conf
+!configs/qwen3.5-9b-vision-q4kxl-server.conf
+!configs/qwen3.5-9b-vision-q4kxl-chat.conf
 
 # Editor / OS noise
 .vscode/
