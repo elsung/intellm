@@ -148,6 +148,16 @@ vm.vfs_cache_pressure = 50
 - `GGML_SYCL_DISABLE_OPT=1` was needed in mid-2025 against output corruption (issue #21893) — verified fixed in llama.cpp ≥ bbeb89d (2026-05). Re-enable if you see garbled output after a future pull.
 - On MoE/hybrid (Mamba) models, Vulkan currently outperforms SYCL on prompt processing; on dense transformers SYCL is the better choice. Run `intellm --mode bench` on both and compare for your specific model.
 
+## Research & decisions
+
+This project is investigation-driven. Notes live in [`docs/`](./docs/):
+
+- [`docs/benchmarks.md`](./docs/benchmarks.md) — measured perf numbers (always with hardware + commit hash + command line)
+- [`docs/decisions.md`](./docs/decisions.md) — append-only log of design choices and why
+- [`docs/research/`](./docs/research/) — deep-dive investigations: agent findings, paper notes, prototyping plans
+
+Currently in flight: KV cache offloading on Intel GPU (extending usable context window beyond VRAM). See [`docs/research/2026-05-12-synthesis-kv-offload-plan.md`](./docs/research/2026-05-12-synthesis-kv-offload-plan.md) for the current plan.
+
 ## License
 
 MIT. Bring your own llama.cpp (MIT) and models (their own licenses).
