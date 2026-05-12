@@ -1,0 +1,478 @@
+#!/usr/bin/env bash
+# intellm — interactive + scriptable launcher for local LLM inference.
+#
+# Drives llama.cpp builds: pick build -> mode -> model -> ctx -> kv -> run.
+# Works fully interactively, fully non-interactively via flags, or anywhere
+# in between (flags + interactive prompts for whatever's missing).
+#
+# Layout (relative to $INTELLM_HOME):
+#   intellm                       this script
+#   llama.cpp/builds.conf         registry of compiled backends
+#   llama.cpp/env-*.sh            optional per-build env setup (oneAPI etc.)
+#   llama.cpp/gguf-ctx.py         model context-length probe
+#   configs/<name>.conf           named configs (key=value)
+#   configs/default.conf          (optional) loaded when no --config given
+#   *.gguf                        models (depth <= 3)
+#
+# Environment overrides:
+#   INTELLM_HOME   project root (auto-detected from script location)
+#   MODELS_DIR     model search root (default: $INTELLM_HOME)
+#   KVCACHE_DIR    persistent prompt-cache files (default: /mnt/optane/kv-cache)
+
+set -euo pipefail
+
+# ---------------- paths ----------------
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
+INTELLM_HOME="${INTELLM_HOME:-$SCRIPT_DIR}"
+MODELS_DIR="${MODELS_DIR:-$INTELLM_HOME}"
+LCPP_DIR="$INTELLM_HOME/llama.cpp"
+BUILDS_CONF="$LCPP_DIR/builds.conf"
+GGUF_CTX="$LCPP_DIR/gguf-ctx.py"
+CONFIGS_DIR="$INTELLM_HOME/configs"
+KVCACHE_DIR="${KVCACHE_DIR:-/mnt/optane/kv-cache}"
+
+# ---------------- helpers ----------------
+die()   { printf '\n\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+hr()    { printf '\033[2m%s\033[0m\n' "----------------------------------------"; }
+title() { printf '\n\033[1;36m%s\033[0m\n' "$*"; hr; }
+dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
+trim()  { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+pretty_ctx() {
+  local n="$1"
+  if   (( n >= 1048576 )); then printf '%dM (%s)' "$((n/1048576))" "$(printf "%'d" "$n")"
+  elif (( n >= 1024 ));    then printf '%dK (%s)'  "$((n/1024))"    "$(printf "%'d" "$n")"
+  else                          printf '%s'         "$(printf "%'d" "$n")"
+  fi
+}
+
+# Resolve a path from builds.conf: if relative, anchor to $INTELLM_HOME.
+resolve() {
+  local p="$1"
+  [[ -z "$p" ]] && return 0
+  [[ "${p:0:1}" == "/" ]] && { printf '%s' "$p"; return 0; }
+  printf '%s/%s' "$INTELLM_HOME" "$p"
+}
+
+# ---------------- defaults ----------------
+BUILD_SHORT=""    # vulkan | sycl | ...
+MODE=""           # cli | server | bench
+MODEL_SPEC=""     # filename in MODELS_DIR, abs path, or hf:repo:quant
+CTX=""
+KV_TYPE=""
+HOST="0.0.0.0"
+PORT="8080"
+SLOTS=1
+PROMPT_CACHE_NAME=""   # name (no ext); resolves to $KVCACHE_DIR/<name>.bin
+NAMED_CONFIG=""
+FORCE_INTERACTIVE=""
+LIST_KIND=""
+LIST_JSON=""
+
+usage() {
+  cat <<EOF
+intellm — local LLM launcher (llama.cpp backends)
+
+Usage:
+  intellm                          interactive (or default config if present)
+  intellm --config NAME            load a named config, then run (flags can override)
+  intellm --build sycl --mode chat --model Qwen3.6-27B-Q6_K.gguf --ctx 32768 --kv q8_0
+  intellm --list builds|models|configs
+  intellm --list-json builds|models|configs
+
+Flags:
+  --config NAME            load $CONFIGS_DIR/NAME.conf (then any flag below overrides)
+  --build SHORTNAME        backend (per builds.conf): e.g. vulkan, sycl
+  --mode chat|server|bench
+  --model NAME|PATH        GGUF filename under MODELS_DIR, absolute path,
+                           or hf:<repo>:<quant>  (e.g. hf:bartowski/Qwen2.5-3B-Instruct-GGUF:Q4_K_M)
+  --ctx N                  context tokens (e.g. 8192, 32768, 1048576)
+  --kv f16|q8_0|q4_0       KV cache precision (default f16)
+  --host HOST              server bind host (default 0.0.0.0)
+  --port PORT              server port (default 8080)
+  --slots N                server parallel slots (default 1)
+  --prompt-cache NAME      chat prompt-cache file under \$KVCACHE_DIR
+  --interactive            force interactive even if a default config exists
+  --help, -h               show this
+
+Environment (override at invocation):
+  INTELLM_HOME    project root           (current: $INTELLM_HOME)
+  MODELS_DIR      model search root      (current: $MODELS_DIR)
+  KVCACHE_DIR     prompt-cache dir       (current: $KVCACHE_DIR)
+EOF
+}
+
+# ---------------- arg parsing ----------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)         usage; exit 0 ;;
+    --config)          NAMED_CONFIG="$2"; shift 2 ;;
+    --build)           BUILD_SHORT="$2"; shift 2 ;;
+    --mode)            MODE="$2"; shift 2 ;;
+    --model)           MODEL_SPEC="$2"; shift 2 ;;
+    --ctx)             CTX="$2"; shift 2 ;;
+    --kv)              KV_TYPE="$2"; shift 2 ;;
+    --host)            HOST="$2"; shift 2 ;;
+    --port)            PORT="$2"; shift 2 ;;
+    --slots)           SLOTS="$2"; shift 2 ;;
+    --prompt-cache)    PROMPT_CACHE_NAME="$2"; shift 2 ;;
+    --interactive)     FORCE_INTERACTIVE=1; shift ;;
+    --list)            LIST_KIND="$2"; shift 2 ;;
+    --list-json)       LIST_JSON="$2"; shift 2 ;;
+    *)                 echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# ---------------- load default + named config ----------------
+# Named --config overrides default. Flags override config values.
+load_config() {
+  local name="$1"
+  local path="$CONFIGS_DIR/$name.conf"
+  [[ -f "$path" ]] || die "no such config: $name ($path)"
+  # Configs are sourced in a subshell-like pattern: set local vars only,
+  # then promote to our defaults only when the corresponding flag wasn't set.
+  local build="" mode="" model="" ctx="" kv="" host="" port="" slots="" prompt_cache=""
+  # shellcheck disable=SC1090
+  source "$path"
+  [[ -z "$BUILD_SHORT"       && -n "$build"        ]] && BUILD_SHORT="$build"
+  [[ -z "$MODE"              && -n "$mode"         ]] && MODE="$mode"
+  [[ -z "$MODEL_SPEC"        && -n "$model"        ]] && MODEL_SPEC="$model"
+  [[ -z "$CTX"               && -n "$ctx"          ]] && CTX="$ctx"
+  [[ -z "$KV_TYPE"           && -n "$kv"           ]] && KV_TYPE="$kv"
+  [[ "$HOST" == "0.0.0.0"    && -n "$host"         ]] && HOST="$host"
+  [[ "$PORT" == "8080"       && -n "$port"         ]] && PORT="$port"
+  [[ "$SLOTS" == "1"         && -n "$slots"        ]] && SLOTS="$slots"
+  [[ -z "$PROMPT_CACHE_NAME" && -n "$prompt_cache" ]] && PROMPT_CACHE_NAME="$prompt_cache"
+  return 0
+}
+
+if [[ -z "$NAMED_CONFIG" && -z "$FORCE_INTERACTIVE" && -f "$CONFIGS_DIR/default.conf" ]]; then
+  NAMED_CONFIG="default"
+fi
+[[ -n "$NAMED_CONFIG" ]] && load_config "$NAMED_CONFIG"
+
+# ---------------- read builds.conf ----------------
+[[ -f "$BUILDS_CONF" ]] || die "no builds.conf at $BUILDS_CONF"
+
+declare -a B_SHORT B_NAME B_BIN B_ENV B_EXTRA
+while IFS='|' read -r s n b e x; do
+  s="$(trim "$s")"
+  [[ -z "$s" || "${s:0:1}" == "#" ]] && continue
+  n="$(trim "$n")"; b="$(resolve "$(trim "$b")")"; e="$(resolve "$(trim "$e")")"; x="$(trim "$x")"
+  [[ -d "$b" ]] || continue   # skip uncompiled builds
+  B_SHORT+=("$s"); B_NAME+=("$n"); B_BIN+=("$b"); B_ENV+=("$e"); B_EXTRA+=("$x")
+done < "$BUILDS_CONF"
+
+[[ ${#B_SHORT[@]} -gt 0 ]] || die "no compiled builds available"
+
+# ---------------- list mode ----------------
+list_builds_text() {
+  local i
+  for i in "${!B_SHORT[@]}"; do
+    printf '%-8s %s\n' "${B_SHORT[$i]}" "${B_NAME[$i]}"
+  done
+}
+list_models_text() {
+  find -L "$MODELS_DIR" -maxdepth 3 -name '*.gguf' -type f -not -iname 'mmproj*' -printf '%P\n' 2>/dev/null | sort
+}
+list_configs_text() {
+  [[ -d "$CONFIGS_DIR" ]] || return 0
+  find "$CONFIGS_DIR" -maxdepth 1 -name '*.conf' -type f -printf '%f\n' 2>/dev/null | sed 's/\.conf$//' | sort
+}
+
+# Minimal JSON array builder (handles strings only; values are simple).
+to_json_array() {
+  local first=1 line
+  printf '['
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ $first -eq 1 ]] || printf ','
+    printf '"%s"' "${line//\"/\\\"}"
+    first=0
+  done
+  printf ']\n'
+}
+
+if [[ -n "$LIST_KIND" ]]; then
+  case "$LIST_KIND" in
+    builds)  list_builds_text ;;
+    models)  list_models_text ;;
+    configs) list_configs_text ;;
+    *) die "--list expects builds|models|configs" ;;
+  esac
+  exit 0
+fi
+if [[ -n "$LIST_JSON" ]]; then
+  case "$LIST_JSON" in
+    builds)  list_builds_text  | awk '{print $1}' | to_json_array ;;
+    models)  list_models_text  | to_json_array ;;
+    configs) list_configs_text | to_json_array ;;
+    *) die "--list-json expects builds|models|configs" ;;
+  esac
+  exit 0
+fi
+
+# ---------------- resolve build ----------------
+pick_build_by_short() {
+  local s="$1" i
+  for i in "${!B_SHORT[@]}"; do
+    [[ "${B_SHORT[$i]}" == "$s" ]] && { BUILD_IDX="$i"; return 0; }
+  done
+  return 1
+}
+
+if [[ -n "$BUILD_SHORT" ]]; then
+  pick_build_by_short "$BUILD_SHORT" || die "no build named '$BUILD_SHORT'. Try: $(printf '%s ' "${B_SHORT[@]}")"
+elif [[ ${#B_SHORT[@]} -eq 1 ]]; then
+  BUILD_IDX=0
+  BUILD_SHORT="${B_SHORT[0]}"
+  dim "(only one build available: ${B_NAME[0]})"
+else
+  title "Build"
+  PS3=$'\nbuild> '
+  select _ in "${B_NAME[@]}"; do
+    [[ "${REPLY:-}" =~ ^[0-9]+$ && $REPLY -ge 1 && $REPLY -le ${#B_NAME[@]} ]] && break
+    echo "invalid choice"
+  done
+  BUILD_IDX=$((REPLY-1))
+  BUILD_SHORT="${B_SHORT[$BUILD_IDX]}"
+fi
+BUILD_NAME="${B_NAME[$BUILD_IDX]}"
+BUILD_BIN="${B_BIN[$BUILD_IDX]}"
+BUILD_ENV="${B_ENV[$BUILD_IDX]}"
+BUILD_EXTRA_ARGS="${B_EXTRA[$BUILD_IDX]}"
+
+# ---------------- resolve mode ----------------
+if [[ -z "$MODE" ]]; then
+  title "Mode"
+  MODES_DISPLAY=("chat (interactive)" "server (HTTP, OpenAI-compatible)" "bench (throughput test)")
+  PS3=$'\nmode> '
+  select _ in "${MODES_DISPLAY[@]}"; do
+    [[ "${REPLY:-}" =~ ^[1-3]$ ]] && break
+    echo "invalid choice"
+  done
+  case "$REPLY" in
+    1) MODE=cli ;;
+    2) MODE=server ;;
+    3) MODE=bench ;;
+  esac
+fi
+# accept user-friendly aliases
+case "$MODE" in
+  chat|cli)  MODE=cli ;;
+  server|serve|http) MODE=server ;;
+  bench|benchmark)   MODE=bench ;;
+  *) die "unknown mode '$MODE' (use: chat|server|bench)" ;;
+esac
+
+# ---------------- resolve model ----------------
+MODEL_PATH=""
+declare -a MODEL_ARGS=()
+MODEL_LABEL=""
+
+resolve_model_spec() {
+  local spec="$1"
+  if [[ "$spec" == hf:* ]]; then
+    MODEL_ARGS=(-hf "${spec#hf:}")
+    MODEL_LABEL="$spec"
+  elif [[ "$spec" == /* ]]; then
+    [[ -f "$spec" ]] || die "model not found: $spec"
+    MODEL_PATH="$spec"
+    MODEL_ARGS=(-m "$spec")
+    MODEL_LABEL="$(basename "$spec")"
+  else
+    # filename — look under MODELS_DIR
+    local cand="$MODELS_DIR/$spec"
+    [[ -f "$cand" ]] || die "model not found in MODELS_DIR: $spec"
+    MODEL_PATH="$cand"
+    MODEL_ARGS=(-m "$cand")
+    MODEL_LABEL="$spec"
+  fi
+}
+
+if [[ -n "$MODEL_SPEC" ]]; then
+  resolve_model_spec "$MODEL_SPEC"
+else
+  title "Model"
+  mapfile -t MODELS < <(find -L "$MODELS_DIR" -maxdepth 3 -name '*.gguf' -type f -not -iname 'mmproj*' -printf '%P\n' 2>/dev/null | sort)
+  OPTS=("${MODELS[@]}" "[paste Hugging Face repo:quant]")
+  PS3=$'\nmodel> '
+  select _ in "${OPTS[@]}"; do
+    [[ "${REPLY:-}" =~ ^[0-9]+$ && $REPLY -ge 1 && $REPLY -le ${#OPTS[@]} ]] && break
+    echo "invalid choice"
+  done
+  PICK="${OPTS[$((REPLY-1))]}"
+  if [[ "$PICK" == "[paste Hugging Face repo:quant]" ]]; then
+    read -rp "HF repo:quant (e.g. bartowski/Qwen2.5-3B-Instruct-GGUF:Q4_K_M): " HF_REF
+    [[ -n "$HF_REF" ]] || die "no model"
+    resolve_model_spec "hf:$HF_REF"
+  else
+    resolve_model_spec "$PICK"
+  fi
+fi
+
+# ---------------- resolve context window ----------------
+if [[ "$MODE" == "bench" ]]; then
+  CTX=4096
+elif [[ -z "$CTX" ]]; then
+  title "Context window"
+  MODEL_MAX=""
+  if [[ -n "$MODEL_PATH" && -f "$GGUF_CTX" ]]; then
+    MODEL_MAX="$(python3 "$GGUF_CTX" "$MODEL_PATH" 2>/dev/null || true)"
+  fi
+  CTX_PRESETS_LABEL=()
+  CTX_PRESETS_VAL=()
+  if [[ -n "$MODEL_MAX" && "$MODEL_MAX" =~ ^[0-9]+$ ]]; then
+    CTX_PRESETS_LABEL+=("$(pretty_ctx "$MODEL_MAX")  ← model max")
+    CTX_PRESETS_VAL+=("$MODEL_MAX")
+    dim "(model trained context: $(pretty_ctx "$MODEL_MAX"))"
+  else
+    dim "(could not read model's trained context — falling back to presets)"
+  fi
+  for p in 4096 8192 16384 32768 65536 131072 204800 262144 524288 1048576; do
+    [[ "$p" == "${MODEL_MAX:-}" ]] && continue
+    CTX_PRESETS_LABEL+=("$(pretty_ctx "$p")")
+    CTX_PRESETS_VAL+=("$p")
+  done
+  CTX_PRESETS_LABEL+=("custom...")
+  CTX_PRESETS_VAL+=("0")
+  PS3=$'\nctx> '
+  select _ in "${CTX_PRESETS_LABEL[@]}"; do
+    [[ "${REPLY:-}" =~ ^[0-9]+$ && $REPLY -ge 1 && $REPLY -le ${#CTX_PRESETS_LABEL[@]} ]] && break
+    echo "invalid choice"
+  done
+  CTX="${CTX_PRESETS_VAL[$((REPLY-1))]}"
+  if [[ "$CTX" == "0" ]]; then
+    read -rp "custom context size in tokens (e.g. 12288): " CTX
+    [[ "$CTX" =~ ^[0-9]+$ && $CTX -ge 256 ]] || die "invalid ctx size"
+  fi
+fi
+
+[[ "$CTX" =~ ^[0-9]+$ ]] || die "invalid ctx: $CTX"
+
+# warn if exceeds model max
+if [[ -n "$MODEL_PATH" && -f "$GGUF_CTX" && "$MODE" != "bench" ]]; then
+  _mm="$(python3 "$GGUF_CTX" "$MODEL_PATH" 2>/dev/null || true)"
+  if [[ -n "$_mm" && "$CTX" -gt "$_mm" ]]; then
+    dim "(warning: $CTX exceeds model's trained context $_mm — works via RoPE scaling, quality may degrade)"
+  fi
+fi
+
+# ---------------- resolve KV cache type ----------------
+if [[ "$MODE" != "bench" && -z "$KV_TYPE" ]]; then
+  title "KV cache precision"
+  dim "f16 = full quality / full memory. q8_0 ≈ ½ memory, near-zero quality hit. q4_0 ≈ ¼ memory, noticeable hit."
+  KV_OPTS=("f16 (default, no compression)" "q8_0 (½ memory)" "q4_0 (¼ memory)")
+  KV_VALS=("f16" "q8_0" "q4_0")
+  PS3=$'\nkv> '
+  select _ in "${KV_OPTS[@]}"; do
+    [[ "${REPLY:-}" =~ ^[1-3]$ ]] && break
+    echo "invalid choice"
+  done
+  KV_TYPE="${KV_VALS[$((REPLY-1))]}"
+fi
+[[ "$MODE" == "bench" || "$KV_TYPE" =~ ^(f16|q8_0|q4_0)$ ]] || die "invalid kv type: $KV_TYPE"
+
+# ---------------- prompt cache (chat only) ----------------
+PROMPT_CACHE_FILE=""
+if [[ "$MODE" == "cli" && -d "$KVCACHE_DIR" && -w "$KVCACHE_DIR" ]]; then
+  if [[ -n "$PROMPT_CACHE_NAME" ]]; then
+    PROMPT_CACHE_FILE="$KVCACHE_DIR/${PROMPT_CACHE_NAME}.bin"
+  elif [[ -z "$BUILD_SHORT$MODE$MODEL_SPEC$CTX$KV_TYPE" || -z "$NAMED_CONFIG$LIST_KIND$LIST_JSON" ]]; then
+    # Only prompt if we're already in interactive mode (something else asked).
+    # Skip the prompt if invocation was fully non-interactive (config or all flags).
+    if [[ -z "${SKIP_PCACHE_PROMPT:-}" ]] && [[ -t 0 ]] && [[ -z "${NAMED_CONFIG:-}" || -n "$FORCE_INTERACTIVE" ]]; then
+      title "Prompt cache (Optane)"
+      dim "Snapshots KV state after first prompt and reloads it next run (instant prefill)."
+      mapfile -t EXISTING_CACHES < <(find "$KVCACHE_DIR" -maxdepth 1 -name '*.bin' -type f -printf '%f\n' 2>/dev/null | sort)
+      PC_OPTS=("off (default)" "[new named cache]" "${EXISTING_CACHES[@]}")
+      PS3=$'\npromptcache> '
+      select _ in "${PC_OPTS[@]}"; do
+        [[ "${REPLY:-}" =~ ^[0-9]+$ && $REPLY -ge 1 && $REPLY -le ${#PC_OPTS[@]} ]] && break
+        echo "invalid choice"
+      done
+      case "$REPLY" in
+        1) PROMPT_CACHE_FILE="" ;;
+        2)
+          read -rp "cache name (no extension): " pc_name
+          pc_name="${pc_name//[^a-zA-Z0-9_-]/}"
+          [[ -n "$pc_name" ]] || die "empty cache name"
+          PROMPT_CACHE_FILE="$KVCACHE_DIR/${pc_name}.bin"
+          ;;
+        *)
+          PROMPT_CACHE_FILE="$KVCACHE_DIR/${PC_OPTS[$((REPLY-1))]}"
+          ;;
+      esac
+    fi
+  fi
+fi
+
+# ---------------- server-only prompts ----------------
+if [[ "$MODE" == "server" ]]; then
+  # Only ask if we're missing host/port info and stdin is a tty (interactive).
+  if [[ "$HOST" == "0.0.0.0" && "$PORT" == "8080" && "$SLOTS" == "1" && -t 0 && -z "$NAMED_CONFIG" ]] || [[ -n "$FORCE_INTERACTIVE" ]]; then
+    title "Server bind"
+    read -rp "host [$HOST]: " in_host; HOST="${in_host:-$HOST}"
+    read -rp "port [$PORT]: " in_port; PORT="${in_port:-$PORT}"
+    title "Concurrent users (parallel slots)"
+    dim "Each slot handles one concurrent request; total ctx is split across slots."
+    read -rp "slots [$SLOTS]: " in_slots; SLOTS="${in_slots:-$SLOTS}"
+  fi
+  [[ "$PORT"  =~ ^[0-9]+$ ]] || die "port must be a number"
+  [[ "$SLOTS" =~ ^[0-9]+$ && $SLOTS -ge 1 && $SLOTS -le 64 ]] || die "slots must be 1..64"
+fi
+
+# ---------------- activate build env ----------------
+if [[ -n "$BUILD_ENV" && -f "$BUILD_ENV" ]]; then
+  # shellcheck disable=SC1090
+  source "$BUILD_ENV"
+fi
+
+# ---------------- assemble + exec ----------------
+case "$MODE" in
+  cli)    BIN="$BUILD_BIN/llama-cli" ;;
+  server) BIN="$BUILD_BIN/llama-server" ;;
+  bench)  BIN="$BUILD_BIN/llama-bench" ;;
+esac
+[[ -x "$BIN" ]] || die "$BIN not found or not executable"
+
+declare -a KV_ARGS=()
+if [[ "$MODE" != "bench" && -n "$KV_TYPE" && "$KV_TYPE" != "f16" ]]; then
+  KV_ARGS=(--cache-type-k "$KV_TYPE" --cache-type-v "$KV_TYPE")
+fi
+declare -a PC_ARGS=()
+if [[ -n "$PROMPT_CACHE_FILE" ]]; then
+  PC_ARGS=(--prompt-cache "$PROMPT_CACHE_FILE" --prompt-cache-all)
+fi
+
+declare -a ARGS
+case "$MODE" in
+  cli)
+    ARGS=("${MODEL_ARGS[@]}" -c "$CTX" -ngl 99 --color on -cnv -fa auto "${KV_ARGS[@]}" "${PC_ARGS[@]}")
+    ;;
+  server)
+    ARGS=("${MODEL_ARGS[@]}" -c "$CTX" -ngl 99 --host "$HOST" --port "$PORT" -fa auto --jinja -np "$SLOTS" -cb "${KV_ARGS[@]}")
+    ;;
+  bench)
+    ARGS=("${MODEL_ARGS[@]}" -ngl 99 -p 512 -n 128 -r 3)
+    ;;
+esac
+
+title "Launching"
+printf '  build:   %s (%s)\n' "$BUILD_NAME" "$BUILD_SHORT"
+printf '  mode:    %s\n' "$MODE"
+printf '  model:   %s\n' "$MODEL_LABEL"
+[[ "$MODE" != "bench" ]] && printf '  ctx:     %s\n' "$(pretty_ctx "$CTX")"
+[[ "$MODE" != "bench" && -n "$KV_TYPE" ]] && printf '  kv:      %s\n' "$KV_TYPE"
+[[ -n "$PROMPT_CACHE_FILE" ]] && printf '  pcache:  %s\n' "$PROMPT_CACHE_FILE"
+if [[ "$MODE" == "server" ]]; then
+  printf '  bind:    http://%s:%s\n' "$HOST" "$PORT"
+  printf '  slots:   %s (continuous batching on)\n' "$SLOTS"
+fi
+printf '  binary:  %s\n' "$BIN"
+hr
+
+# shellcheck disable=SC2086
+exec "$BIN" "${ARGS[@]}" $BUILD_EXTRA_ARGS

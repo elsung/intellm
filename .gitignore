@@ -1,0 +1,26 @@
+# Models — large, machine-specific, often gigabytes
+*.gguf
+mmproj-*
+
+# llama.cpp source clone — bring your own (see README)
+llama.cpp/src/
+
+# Per-machine build artifacts
+llama.cpp/build-*/
+
+# Per-user named configs except the bundled example/default
+configs/*.conf
+!configs/example.conf
+!configs/default.conf
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Local scratch
+*.log
+*.tmp
+.cache/
