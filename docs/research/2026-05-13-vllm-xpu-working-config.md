@@ -122,3 +122,32 @@ Worth re-investigating, but lower priority now that we have a working production
 2. **`--enforce-eager` for any XPU vLLM run** — there's no real CUDA-graph equivalent on XPU and enabling capture seems to expose more bugs than it helps.
 3. **The IPEX-based container works today despite IPEX being EOL.** For prototyping/serving in May 2026, prefer the working setup over the architecturally-cleaner one. Migrate when forced.
 4. **Spend the agent-credits early in the debugging journey.** The breakthrough flags (`--enforce-eager`, `TRITON_ATTN`) came from Agent A's research late in the session. Earlier research could have shortened the debugging by hours.
+
+## Update 2026-05-13: VSA pipeline issues found and fixed
+
+After getting vLLM-XPU running and completing a full VSA pipeline:
+
+- **VLM stage:** worked beautifully. Single-image smoke test 26s; full 43-chunk VSA run completed VLM stage in ~25 min with 0 errors after we bumped `--max-model-len` from 8192 → 16384 (VSA's 30-frame batches need ~12K tokens of input + headroom).
+- **Transcription bug discovered:** VSA's `pipeline.py` was falsely selecting CUDA on this Intel rig via `ctranslate2.get_supported_compute_types("cuda")` — that returns compile-time support, not runtime availability. Patched in [2026-05-13-vsa-ctranslate2-cuda-detect-patch.md](./2026-05-13-vsa-ctranslate2-cuda-detect-patch.md). Patch is backward-compatible with all existing CUDA setups (preserves exact prior behavior on those).
+- **Configuration saved:** the working setup is canonical now:
+  - `/mnt/optane/LLMs/vllm/start.sh` — idempotent vLLM container launcher with all the patches mounted
+  - `Video_Analyzer/vsa-vllm.sh` — wrapper that starts vLLM + sets `CUDA_VISIBLE_DEVICES=""` + delegates to `./vsa`
+  - `Video_Analyzer/config.profiles/intellm-b70.yaml` — the profile, now vlm.provider=vllm by default
+
+## Reproducible run sequence
+
+```bash
+# One-time: ensure patches applied
+cd ~/ai/Video_Analyzer
+git apply patches/transcribe-runtime-cuda-gate.patch  # if not yet applied
+
+# Any subsequent run:
+./vsa-vllm.sh "My Video.mp4"
+```
+
+That's it. The wrapper:
+1. Checks if vLLM is running; starts it (with all patches) if not
+2. Forces `CUDA_VISIBLE_DEVICES=""` to belt-and-suspenders the CPU transcription path
+3. Runs the full VSA pipeline → GLS + QG outputs in `projects/<slug>/analysis/v<N>/`
+
+When done with all runs for the day: `/mnt/optane/LLMs/vllm/start.sh stop`
