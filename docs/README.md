@@ -19,4 +19,6 @@ Living documentation for the project. Keep it append-only where reasonable; when
 
 ## Topics in flight
 
-- KV cache offloading for Intel GPU (VRAM → CPU → Optane SSD). Two research streams running 2026-05-12; outputs will land in `research/`.
+- **CURRENT STATE:** [2026-05-13 session summary](./2026-05-13-session-summary.md) — vLLM-XPU + VSA + Qwen3.5-9B working end-to-end, plus next steps for the next session.
+- KV cache offloading for Intel GPU — investigated; physics-blocked on current hardware/software. See [synthesis](./research/2026-05-12-synthesis-kv-offload-plan.md). Will revisit if vLLM grows multi-tier KV.
+- vLLM-XPU on Battlemage — working as of 2026-05-13. Three earlier attempts failed; the working config is in [research/2026-05-13-vllm-xpu-working-config.md](./research/2026-05-13-vllm-xpu-working-config.md).
